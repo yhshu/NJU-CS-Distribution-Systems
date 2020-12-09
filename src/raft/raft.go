@@ -35,6 +35,18 @@ type ApplyMsg struct {
 	Snapshot    []byte // ignore for lab2; only used in lab3
 }
 
+type LogEntry struct {
+	Command interface{} // command for state machine
+	Term    int         // term when entry was received by leader
+	Index   int         // the first index is 1
+}
+
+const (
+	State_follower  string = "follower"
+	State_candidate string = "candidate"
+	State_leader    string = "leader"
+)
+
 //
 // A Go object implementing a single Raft peer.
 //
@@ -48,6 +60,22 @@ type Raft struct {
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
 
+	/* Written by Yiheng Shu */
+
+	// Persistent state on all servers:
+	currentTerm int        // 	latest term server has been (initialized to 0 on first boot, increases monotonically)
+	votedFor    int        // candidateId that received vote in current term (or null if none)
+	log         []LogEntry // log entries; each entry contains command for state machine, and term when entry was received by leader
+
+	// volatile state on all servers:
+	commitIndex int // index of highest log entry known to be committed (initialized to 0, increases monotonically)
+	lastApplied int // index of highest log entry applied to state machine (initialized to 0, increases monotonically)
+
+	// volatile state on leaders: reinitialized after election
+	nextIndex  []int // for each server, index of the next log entry to send to that server (initialized to leader last log index + 1)
+	matchIndex []int // for each server, index of highest log entry known to be replicated on server (initialized to 0, increases monotonically)
+
+	state string // 'follower', 'candidate', or 'leader'
 }
 
 // return currentTerm and whether this server
@@ -57,6 +85,14 @@ func (rf *Raft) GetState() (int, bool) {
 	var term int
 	var isleader bool
 	// Your code here.
+
+	/* Written by Yiheng Shu */
+	rf.mu.Lock()
+	term = rf.currentTerm
+	if rf.state == State_leader {
+		isleader = true
+	}
+	rf.mu.Unlock()
 	return term, isleader
 }
 
