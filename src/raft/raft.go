@@ -20,7 +20,9 @@ package raft
 import (
 	"bytes"
 	"encoding/gob"
+	"math/rand"
 	"sync"
+	"time"
 )
 import "labrpc"
 
@@ -45,10 +47,12 @@ type LogEntry struct {
 	Index   int         // the first index is 1
 }
 
+type State string
+
 const (
-	State_follower  string = "follower"
-	State_candidate string = "candidate"
-	State_leader    string = "leader"
+	Follower  State = "follower"
+	Candidate       = "candidate"
+	Leader          = "leader"
 )
 
 //
@@ -64,6 +68,7 @@ type Raft struct {
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
 
+	// Assignment 1
 	// Persistent state on all servers:
 	currentTerm int        // 	latest term server has been (initialized to 0 on first boot, increases monotonically)
 	votedFor    int        // candidateId that received vote in current term (or null if none)
@@ -77,7 +82,14 @@ type Raft struct {
 	nextIndex  []int // for each server, index of the next log entry to send to that server (initialized to leader last log index + 1)
 	matchIndex []int // for each server, index of highest log entry known to be replicated on server (initialized to 0, increases monotonically)
 
-	state string // 'follower', 'candidate', or 'leader'
+	// other states
+	state           State // 'follower', 'candidate', or 'leader'
+	voteNum         int   // the number of votes it has
+	grantVoteCh     chan bool
+	heartBeatCh     chan bool
+	leaderCh        chan bool
+	timer           *time.Timer
+	electionTimeout int
 }
 
 // return currentTerm and whether this server
@@ -88,11 +100,12 @@ func (rf *Raft) GetState() (int, bool) {
 	var isleader bool
 	// Your code here.
 
+	// Assignment 1
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
 	term = rf.currentTerm
-	if rf.state == State_leader {
+	if rf.state == Leader {
 		isleader = true
 	}
 	return term, isleader
@@ -113,8 +126,11 @@ func (rf *Raft) persist() {
 	// data := w.Bytes()
 	// rf.persister.SaveRaftState(data)
 
+	// Assignment 3
+
 	w := new(bytes.Buffer)
 	e := gob.NewEncoder(w)
+	// only the persistent state
 	e.Encode(rf.currentTerm)
 	e.Encode(rf.votedFor)
 	e.Encode(rf.log)
@@ -133,14 +149,16 @@ func (rf *Raft) readPersist(data []byte) {
 	// d.Decode(&rf.xxx)
 	// d.Decode(&rf.yyy)
 
+	// Assignment 3
+
 	r := bytes.NewBuffer(data)
+	if data == nil || len(data) == 0 {
+		return
+	}
 	d := gob.NewDecoder(r)
 	d.Decode(&rf.currentTerm)
 	d.Decode(&rf.votedFor)
 	d.Decode(&rf.log)
-	if data == nil || len(data) < 1 {
-		return
-	}
 }
 
 //
@@ -148,6 +166,8 @@ func (rf *Raft) readPersist(data []byte) {
 //
 type RequestVoteArgs struct {
 	// Your data here.
+
+	// Assignment 1
 
 	Term         int // candidate's term
 	CandidateId  int // candidate requesting vote
@@ -161,6 +181,8 @@ type RequestVoteArgs struct {
 type RequestVoteReply struct {
 	// Your data here.
 
+	// Assignment 1
+
 	Term        int  // currentTerm, for candidate to update itself
 	VoteGranted bool // true means candidate receive vote
 }
@@ -170,51 +192,45 @@ type RequestVoteReply struct {
 //
 func (rf *Raft) RequestVote(args RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here.
+
+	// Assignment 1
+	// The candidate asks others to vote
+
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
-	DPrintf("[INFO] Server %d received RequestVote from candidate %d, current term: %d, current log: %v\n", rf.me, args.CandidateId, args, rf.currentTerm, rf.log)
+	DPrintf("[INFO] Server %d received RequestVote from candidate %d, current term: %d, current log: %v\n", rf.me, args.CandidateId, rf.currentTerm, rf.log)
+
 	if args.Term < rf.currentTerm {
-		reply.Term = rf.currentTerm
-		reply.VoteGranted = false
+		// return current term, and refuse the vote
+		rf.RejectVote(reply)
+
 	} else if args.Term == rf.currentTerm {
+		// if it has votes and the candidateId is not the same, refuse the vote
+
 		if rf.votedFor != -1 && rf.votedFor != args.CandidateId {
-			reply.Term = rf.currentTerm
-			reply.VoteGranted = false
+			rf.RejectVote(reply)
 		} else {
 			lastLogIndex := len(rf.log)
 			lastLogTerm := 0
 			if lastLogIndex > 0 {
 				lastLogTerm = rf.log[lastLogIndex-1].Term
 			}
+
 			if args.LastLogTerm < lastLogTerm {
-				reply.Term = rf.currentTerm
-				reply.VoteGranted = false
-			} else {
-				if args.LastLogTerm == lastLogTerm {
-					if args.LastLogIndex < lastLogIndex {
-						reply.Term = rf.currentTerm
-						reply.VoteGranted = false
-					} else {
-						DPrintf("[INFO] Server %d votes to candidate %d\n", rf.me, args.CandidateId)
-						reply.Term = rf.currentTerm
-						reply.VoteGranted = true
-						rf.votedFor = args.CandidateId
-						rf.persist()
-						rf.setGrantVoteCh()
-					}
-				} else {
-					DPrintf("[INFO] Server %d votes to candidate %d\n", rf.me, args.CandidateId)
-					reply.Term = rf.currentTerm
-					reply.VoteGranted = true
-					rf.votedFor = args.CandidateId
-					rf.persist()
-					rf.setGrantVoteCh()
+				rf.RejectVote(reply)
+			} else if args.LastLogTerm == lastLogTerm {
+				if args.LastLogIndex < lastLogIndex { // refuse the vote
+					rf.RejectVote(reply)
+				} else { // if args.LastLogIndex >= lastLogIndex
+					rf.GrantVote(args, reply)
 				}
+			} else { // if args.LastLogTerm > lastLogTerm
+				rf.GrantVote(args, reply)
 			}
 		}
 	} else { // if args.Term > rf.currentTerm
-		rf.convertToFollower(args.Term, -1)
+		rf.changeToFollower(args.Term, -1)
 		// up-to-date check
 		lastLogIndex := len(rf.log)
 		lastLogTerm := 0
@@ -222,31 +238,31 @@ func (rf *Raft) RequestVote(args RequestVoteArgs, reply *RequestVoteReply) {
 			lastLogTerm = rf.log[lastLogIndex-1].Term
 		}
 		if args.LastLogTerm < lastLogTerm {
-			reply.Term = rf.currentTerm
-			reply.VoteGranted = false
-		} else {
-			if args.LastLogTerm == lastLogTerm {
-				if args.LastLogIndex < lastLogIndex {
-					reply.Term = rf.currentTerm
-					reply.VoteGranted = false
-				} else {
-					DPrintf("Server %d: grant vote to candidate %d\n", rf.me, args.CandidateId)
-					reply.Term = rf.currentTerm
-					reply.VoteGranted = true
-					rf.votedFor = args.CandidateId
-					rf.persist()
-					rf.setGrantVoteCh()
-				}
+			rf.RejectVote(reply)
+		} else if args.LastLogTerm == lastLogTerm {
+			if args.LastLogIndex < lastLogIndex {
+				rf.RejectVote(reply)
 			} else {
-				DPrintf("Server %d: grant vote to candidate %d\n", rf.me, args.CandidateId)
-				reply.Term = rf.currentTerm
-				reply.VoteGranted = true
-				rf.votedFor = args.CandidateId
-				rf.persist()
-				rf.setGrantVoteCh()
+				rf.GrantVote(args, reply)
 			}
+		} else {
+			rf.GrantVote(args, reply)
 		}
 	}
+}
+
+func (rf *Raft) RejectVote(reply *RequestVoteReply) {
+	reply.Term = rf.currentTerm
+	reply.VoteGranted = false
+}
+
+func (rf *Raft) GrantVote(args RequestVoteArgs, reply *RequestVoteReply) {
+	DPrintf("[INFO] Server %d: grant vote to candidate %d\n", rf.me, args.CandidateId)
+	reply.Term = rf.currentTerm
+	reply.VoteGranted = true
+	rf.votedFor = args.CandidateId
+	rf.persist()
+	rf.setGrantVoteCh()
 }
 
 //
@@ -302,6 +318,46 @@ func (rf *Raft) Kill() {
 	// Your code here, if desired.
 }
 
+func (rf *Raft) setGrantVoteCh() {
+	go func() { // a routine
+		select { // block if no case is available
+		case <-rf.grantVoteCh:
+		default:
+		}
+		rf.grantVoteCh <- true
+	}()
+}
+
+func (rf *Raft) changeToFollower(term int, voteFor int) {
+	rf.currentTerm = term
+	rf.state = Follower
+	rf.votedFor = voteFor
+	rf.voteNum = 0
+	rf.persist()
+}
+
+func (rf *Raft) changeToCandidate() {
+	rf.state = Candidate
+	rf.currentTerm++
+	rf.votedFor = rf.me
+	rf.voteNum = 1
+	rf.electionTimeout = GenerateRandom(200, 400)
+	rf.timer.Reset(time.Duration(rf.electionTimeout) * time.Millisecond)
+	rf.persist()
+}
+
+func (rf *Raft) timerClear() {
+	select {
+	case <-rf.timer.C:
+		DPrintf("Server %d clears the old timer\n", rf.me)
+	default:
+	}
+}
+
+func GenerateRandom(min int, max int) int {
+	return rand.New(rand.NewSource(time.Now().UnixNano())).Intn(max-min) + min
+}
+
 //
 // the service or tester wants to create a Raft server. the ports
 // of all the Raft servers (including this one) are in peers[]. this
@@ -322,8 +378,76 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	// Your initialization code here.
 
+	// Assignment 1
+
+	rf.currentTerm = 0
+	rf.votedFor = -1
+	rf.log = []LogEntry{}
+	rf.commitIndex = 0
+	rf.lastApplied = 0
+
+	rf.state = Follower
+	rf.electionTimeout = GenerateRandom(200, 400)
+	rf.grantVoteCh = make(chan bool)
+	rf.heartBeatCh = make(chan bool)
+	rf.leaderCh = make(chan bool)
+	rf.voteNum = 0
+	rf.timer = time.NewTimer(time.Duration(rf.electionTimeout) * time.Millisecond)
+
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
+	DPrintf("[INFO] Server %d persistent state is read\n", rf.me)
+
+	go func() {
+		for {
+			rf.mu.Lock()
+			state := rf.state
+			rf.mu.Unlock()
+			switch {
+			case state == Leader:
+				DPrintf("[INFO] Candidate %d becomes the leader, current term: %d\n", rf.me, rf.currentTerm)
+				rf.startAppendEntries()
+			case state == Candidate:
+				DPrintf("[INFO] Candidate %d starts the election\n", rf.me)
+				go rf.startRequestVote()
+				select {
+				case <-rf.heartBeatCh:
+					DPrintf("[INFO] Candidate %d receives heartbeat when it requests votes, turn back to follower now\n", rf.me)
+					rf.mu.Lock()
+					rf.changeToFollower(rf.currentTerm, -1)
+					rf.mu.Unlock()
+				case <-rf.leaderCh:
+				case <-rf.timer.C:
+					rf.mu.Lock()
+					if rf.state == Follower {
+						DPrintf("[INFO] Candidate %d knows a higher term candidate now, withdraw from the election\n", rf.me)
+						rf.mu.Unlock()
+						continue
+					}
+					rf.changeToCandidate()
+					rf.mu.Unlock()
+				}
+			case state == Follower:
+				rf.mu.Lock()
+				// 必须！比如之前是Leader, 重新连接后转为Follower, 此时rf.timer.C里其实已经有值了
+				rf.timerClear()
+				rf.electionTimeout = GenerateRandom(200, 400)
+				rf.timer.Reset(time.Duration(rf.electionTimeout) * time.Millisecond)
+				rf.mu.Unlock()
+				select {
+				case <-rf.grantVoteCh:
+					DPrintf("[INFO] Server %d resets election time due to grantVote\n", rf.me)
+				case <-rf.heartBeatCh:
+					DPrintf("[INFO] Server %d resets election time due to heartbeat\n", rf.me)
+				case <-rf.timer.C:
+					DPrintf("[INFO] Server %d election timeout, turn to candidate\n", rf.me)
+					rf.mu.Lock()
+					rf.changeToCandidate()
+					rf.mu.Unlock()
+				}
+			}
+		}
+	}()
 
 	return rf
 }
