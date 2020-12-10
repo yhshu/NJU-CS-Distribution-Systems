@@ -17,7 +17,11 @@ package raft
 //   in the same server.
 //
 
-import "sync"
+import (
+	"bytes"
+	"encoding/gob"
+	"sync"
+)
 import "labrpc"
 
 // import "bytes"
@@ -60,8 +64,6 @@ type Raft struct {
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
 
-	/* Written by Yiheng Shu */
-
 	// Persistent state on all servers:
 	currentTerm int        // 	latest term server has been (initialized to 0 on first boot, increases monotonically)
 	votedFor    int        // candidateId that received vote in current term (or null if none)
@@ -86,13 +88,13 @@ func (rf *Raft) GetState() (int, bool) {
 	var isleader bool
 	// Your code here.
 
-	/* Written by Yiheng Shu */
 	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
 	term = rf.currentTerm
 	if rf.state == State_leader {
 		isleader = true
 	}
-	rf.mu.Unlock()
 	return term, isleader
 }
 
@@ -110,6 +112,14 @@ func (rf *Raft) persist() {
 	// e.Encode(rf.yyy)
 	// data := w.Bytes()
 	// rf.persister.SaveRaftState(data)
+
+	w := new(bytes.Buffer)
+	e := gob.NewEncoder(w)
+	e.Encode(rf.currentTerm)
+	e.Encode(rf.votedFor)
+	e.Encode(rf.log)
+	data := w.Bytes()
+	rf.persister.SaveRaftState(data)
 }
 
 //
@@ -122,6 +132,15 @@ func (rf *Raft) readPersist(data []byte) {
 	// d := gob.NewDecoder(r)
 	// d.Decode(&rf.xxx)
 	// d.Decode(&rf.yyy)
+
+	r := bytes.NewBuffer(data)
+	d := gob.NewDecoder(r)
+	d.Decode(&rf.currentTerm)
+	d.Decode(&rf.votedFor)
+	d.Decode(&rf.log)
+	if data == nil || len(data) < 1 {
+		return
+	}
 }
 
 //
@@ -129,6 +148,11 @@ func (rf *Raft) readPersist(data []byte) {
 //
 type RequestVoteArgs struct {
 	// Your data here.
+
+	Term         int // candidate's term
+	CandidateId  int // candidate requesting vote
+	LastLogIndex int // index of candidates last log entry
+	LastLogTerm  int // term of candidate's last log entry
 }
 
 //
@@ -136,6 +160,9 @@ type RequestVoteArgs struct {
 //
 type RequestVoteReply struct {
 	// Your data here.
+
+	Term        int  // currentTerm, for candidate to update itself
+	VoteGranted bool // true means candidate receive vote
 }
 
 //
@@ -143,6 +170,83 @@ type RequestVoteReply struct {
 //
 func (rf *Raft) RequestVote(args RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here.
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	DPrintf("[INFO] Server %d received RequestVote from candidate %d, current term: %d, current log: %v\n", rf.me, args.CandidateId, args, rf.currentTerm, rf.log)
+	if args.Term < rf.currentTerm {
+		reply.Term = rf.currentTerm
+		reply.VoteGranted = false
+	} else if args.Term == rf.currentTerm {
+		if rf.votedFor != -1 && rf.votedFor != args.CandidateId {
+			reply.Term = rf.currentTerm
+			reply.VoteGranted = false
+		} else {
+			lastLogIndex := len(rf.log)
+			lastLogTerm := 0
+			if lastLogIndex > 0 {
+				lastLogTerm = rf.log[lastLogIndex-1].Term
+			}
+			if args.LastLogTerm < lastLogTerm {
+				reply.Term = rf.currentTerm
+				reply.VoteGranted = false
+			} else {
+				if args.LastLogTerm == lastLogTerm {
+					if args.LastLogIndex < lastLogIndex {
+						reply.Term = rf.currentTerm
+						reply.VoteGranted = false
+					} else {
+						DPrintf("[INFO] Server %d votes to candidate %d\n", rf.me, args.CandidateId)
+						reply.Term = rf.currentTerm
+						reply.VoteGranted = true
+						rf.votedFor = args.CandidateId
+						rf.persist()
+						rf.setGrantVoteCh()
+					}
+				} else {
+					DPrintf("[INFO] Server %d votes to candidate %d\n", rf.me, args.CandidateId)
+					reply.Term = rf.currentTerm
+					reply.VoteGranted = true
+					rf.votedFor = args.CandidateId
+					rf.persist()
+					rf.setGrantVoteCh()
+				}
+			}
+		}
+	} else { // if args.Term > rf.currentTerm
+		rf.convertToFollower(args.Term, -1)
+		// up-to-date check
+		lastLogIndex := len(rf.log)
+		lastLogTerm := 0
+		if lastLogIndex > 0 {
+			lastLogTerm = rf.log[lastLogIndex-1].Term
+		}
+		if args.LastLogTerm < lastLogTerm {
+			reply.Term = rf.currentTerm
+			reply.VoteGranted = false
+		} else {
+			if args.LastLogTerm == lastLogTerm {
+				if args.LastLogIndex < lastLogIndex {
+					reply.Term = rf.currentTerm
+					reply.VoteGranted = false
+				} else {
+					DPrintf("Server %d: grant vote to candidate %d\n", rf.me, args.CandidateId)
+					reply.Term = rf.currentTerm
+					reply.VoteGranted = true
+					rf.votedFor = args.CandidateId
+					rf.persist()
+					rf.setGrantVoteCh()
+				}
+			} else {
+				DPrintf("Server %d: grant vote to candidate %d\n", rf.me, args.CandidateId)
+				reply.Term = rf.currentTerm
+				reply.VoteGranted = true
+				rf.votedFor = args.CandidateId
+				rf.persist()
+				rf.setGrantVoteCh()
+			}
+		}
+	}
 }
 
 //
