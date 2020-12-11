@@ -14,7 +14,7 @@ package paxos
 //
 // px = paxos.Make(peers []string, me int)
 // px.Start(seq int, v interface{}) -- start agreement on new instance
-// px.Status(seq int) (Fate, v interface{}) -- get info about an instance
+// px.Success(seq int) (Fate, v interface{}) -- get info about an instance
 // px.Done(seq int) -- ok to forget all instances <= seq
 // px.Max() int -- highest instance seq known, or -1
 // px.Min() int -- instances before this seq have been forgotten
@@ -31,7 +31,7 @@ import "sync/atomic"
 import "fmt"
 import "math/rand"
 
-// px.Status() return values, indicating
+// px.Success() return values, indicating
 // whether an agreement has been decided,
 // or Paxos has not yet reached agreement,
 // or it was agreed but forgotten (i.e. < Min()).
