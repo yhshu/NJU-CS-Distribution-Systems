@@ -46,7 +46,6 @@ type ApplyMsg struct {
 type LogEntry struct {
 	Command interface{} // command for state machine
 	Term    int         // term when entry was received by leader
-	Index   int         // the first index is 1
 }
 
 type State string
@@ -85,14 +84,16 @@ type Raft struct {
 	matchIndex []int // for each server, index of highest log entry known to be replicated on server (initialized to 0, increases monotonically)
 
 	// other states
-	state           State // 'follower', 'candidate', or 'leader'
-	hasVotes        int   // the number of votes it has
-	grantVoteCh     chan bool
-	heartBeatCh     chan bool
-	leaderCh        chan bool
-	timer           *time.Timer
-	electionTimeout int
-	applyCh         chan ApplyMsg
+	state                     State // 'follower', 'candidate', or 'leader'
+	hasVotes                  int   // the number of votes it has
+	grantVoteCh               chan bool
+	heartBeatCh               chan bool
+	leaderCh                  chan bool
+	timer                     *time.Timer
+	applyCh                   chan ApplyMsg
+	heartBeatInterval         time.Duration
+	electionTimeoutLowerBound int
+	electionTimeoutUpperBound int
 }
 
 // return currentTerm and whether this server
@@ -331,10 +332,19 @@ func (rf *Raft) sendAppendEntries(server int, args AppendEntriesArgs, reply *App
 // the leader.
 //
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
-	index := -1
-	term := -1
-	isLeader := true
+	rf.mu.Lock()
 
+	index := -1
+	term := rf.currentTerm
+	isLeader := rf.state == Leader
+
+	if isLeader {
+		rf.log = append(rf.log, LogEntry{command, rf.currentTerm})
+		index = len(rf.log)
+		rf.persist()
+		DPrintf("[INFO] Leader %d starts agreement on command: %v\n", rf.me, command)
+	}
+	rf.mu.Unlock()
 	return index, term, isLeader
 }
 
@@ -371,8 +381,7 @@ func (rf *Raft) changeToCandidate() {
 	rf.currentTerm++
 	rf.votedFor = rf.me
 	rf.hasVotes = 1
-	rf.electionTimeout = RandomInt(150, 300)
-	rf.timer.Reset(time.Duration(rf.electionTimeout) * time.Millisecond)
+	rf.timer.Reset(rf.GetRandomElectionTimeout())
 	rf.persist()
 }
 
@@ -393,9 +402,12 @@ func (rf *Raft) heartBeat() {
 		}
 		DPrintf("[INFO] Leader %d starts sending AppendEntries, current term: %d", rf.me, rf.currentTerm)
 		rf.mu.Unlock()
+
 		for i := 0; i < len(rf.peers); i++ {
 			go rf.appendEntriesToPeers(i)
 		}
+		// heartbeat interval
+		time.Sleep(rf.heartBeatInterval * time.Millisecond)
 	}
 }
 
@@ -427,16 +439,16 @@ func (rf *Raft) appendEntriesToPeers(peerIdx int) {
 		}
 		reply := AppendEntriesReply{}
 		rf.mu.Unlock()
-		rpcRes := rf.sendAppendEntries(peerIdx, args, &reply) // AppendEntries RPC
+		ok := rf.sendAppendEntries(peerIdx, args, &reply) // AppendEntries RPC
 
 		DPrintf("[INFO] Leader %d sends heartbeat to server %d, reply:%v\n", rf.me, peerIdx, reply)
 
-		// if rpcRes is false, the heartbeat is not send successfully, there's two possibilities
+		// if ok is false, the heartbeat is not send successfully, there's two possibilities
 		// 1. the leader disconnects: all heartbeats can't be send, but it keeps trying until the connection gets normal;
 		//    the term is out-dated, and it quits the loop
 		// 2. the follower disconnects: it doesn't stop the leader from keeping sending heartbeats to others
 
-		if rpcRes {
+		if ok {
 			rf.mu.Lock()
 			if reply.Term > rf.currentTerm {
 				// quit the loop, change to follower
@@ -468,9 +480,10 @@ func (rf *Raft) appendEntriesToPeers(peerIdx int) {
 					rf.commitIndex = midCommitIndex
 				}
 				DPrintf("[INFO] Leader %d starts applying logs, last applied: %d, commitIndex: %d", rf.me, rf.lastApplied, rf.commitIndex)
-				//rf.applyLogs()
+				rf.applyLogs()
 				rf.mu.Unlock()
 				return
+
 			} else { // if reply.Success == false
 
 				conflict := false
@@ -493,12 +506,10 @@ func (rf *Raft) appendEntriesToPeers(peerIdx int) {
 				rf.mu.Unlock()
 			}
 
-		} else { // if rpcRes == false
+		} else { // if ok == false
 			DPrintf("[WARN] Leader %d calls AppendEntries to server %d failed", rf.me, peerIdx)
 			return
 		}
-		// heartbeat interval
-		time.Sleep(50 * time.Millisecond)
 	}
 }
 
@@ -623,8 +634,7 @@ func (rf *Raft) Run() {
 			rf.mu.Lock()
 			// the timer needs to be clear, because the server may have been a leader
 			rf.timerClear()
-			rf.electionTimeout = RandomInt(150, 300)
-			rf.timer.Reset(time.Duration(rf.electionTimeout) * time.Millisecond)
+			rf.timer.Reset(rf.GetRandomElectionTimeout())
 			rf.mu.Unlock()
 			select {
 			case <-rf.grantVoteCh:
@@ -632,7 +642,7 @@ func (rf *Raft) Run() {
 			case <-rf.heartBeatCh:
 				DPrintf("[INFO] Server %d resets election time due to heartbeat\n", rf.me)
 			case <-rf.timer.C:
-				DPrintf("[WARN] Server %d election timeout, turn to candidate\n", rf.me)
+				DPrintf("[WARN] Server %d election timeout, turn to candidate\n", rf.me) // run for the leader
 				rf.mu.Lock()
 				rf.changeToCandidate()
 				rf.mu.Unlock()
@@ -746,6 +756,10 @@ func RandomInt(min int, max int) int {
 	return rand.New(rand.NewSource(time.Now().UnixNano())).Intn(max-min) + min
 }
 
+func (rf *Raft) GetRandomElectionTimeout() time.Duration {
+	return time.Duration(RandomInt(rf.electionTimeoutLowerBound, rf.electionTimeoutUpperBound)) * time.Millisecond
+}
+
 //
 // the service or tester wants to create a Raft server. the ports
 // of all the Raft servers (including this one) are in peers[]. this
@@ -775,12 +789,14 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.lastApplied = 0
 
 	rf.state = Follower
-	rf.electionTimeout = RandomInt(150, 300)
+	rf.electionTimeoutLowerBound = 200
+	rf.electionTimeoutUpperBound = 400
+	rf.heartBeatInterval = 100
 	rf.grantVoteCh = make(chan bool)
 	rf.heartBeatCh = make(chan bool)
 	rf.leaderCh = make(chan bool)
 	rf.hasVotes = 0
-	rf.timer = time.NewTimer(time.Duration(rf.electionTimeout) * time.Millisecond)
+	rf.timer = time.NewTimer(rf.GetRandomElectionTimeout())
 	rf.applyCh = applyCh
 
 	// initialize from state persisted before a crash
