@@ -69,7 +69,6 @@ type Raft struct {
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
 
-	// Assignment 1
 	// Persistent state on all servers:
 	currentTerm int        // 	latest term server has been (initialized to 0 on first boot, increases monotonically)
 	votedFor    int        // candidateId that received vote in current term (or null if none)
@@ -84,11 +83,11 @@ type Raft struct {
 	matchIndex []int // for each server, index of highest log entry known to be replicated on server (initialized to 0, increases monotonically)
 
 	// other states
-	state                     State // 'follower', 'candidate', or 'leader'
-	hasVotes                  int   // the number of votes it has
-	grantVoteCh               chan bool
-	heartBeatCh               chan bool
-	leaderCh                  chan bool
+	state                     State     // 'follower', 'candidate', or 'leader'
+	hasVotes                  int       // the number of votes it has
+	grantVoteCh               chan bool // the channel for receiving signals for votes
+	heartBeatCh               chan bool // the channel for receiving signals for heartbeat
+	leaderCh                  chan bool // the channel for receiving signals for becoming leader
 	timer                     *time.Timer
 	applyCh                   chan ApplyMsg // the channel on which the tester of service expects Raft to send ApplyMsg messages
 	heartBeatInterval         time.Duration // the time duration for heart beat interval
@@ -104,7 +103,6 @@ func (rf *Raft) GetState() (int, bool) {
 	var isLeader bool
 	// Your code here.
 
-	// Assignment 1
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
@@ -191,8 +189,6 @@ type AppendEntriesReply struct {
 type RequestVoteArgs struct {
 	// Your data here.
 
-	// Assignment 1
-
 	Term         int // candidate's term
 	CandidateId  int // candidate requesting vote
 	LastLogIndex int // index of candidates last log entry
@@ -217,7 +213,6 @@ type RequestVoteReply struct {
 func (rf *Raft) RequestVote(args RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here.
 
-	// Assignment 1
 	// The candidate asks others to vote
 
 	rf.mu.Lock()
@@ -228,9 +223,7 @@ func (rf *Raft) RequestVote(args RequestVoteArgs, reply *RequestVoteReply) {
 	if args.Term < rf.currentTerm {
 		// return current term, and refuse the vote
 		rf.RejectVote(reply)
-
 	} else if args.Term == rf.currentTerm {
-
 		if rf.votedFor != -1 && rf.votedFor != args.CandidateId { // if it has votes for others, refuse the vote
 			rf.RejectVote(reply)
 		} else {
@@ -345,16 +338,6 @@ func (rf *Raft) Kill() {
 	// Your code here, if desired.
 }
 
-func (rf *Raft) setGrantVoteCh() {
-	go func() { // a routine
-		select { // block if no case is available
-		case <-rf.grantVoteCh:
-		default:
-		}
-		rf.grantVoteCh <- true
-	}()
-}
-
 func (rf *Raft) changeToFollower(term int, voteFor int) {
 	rf.currentTerm = term
 	rf.votedFor = voteFor
@@ -367,7 +350,7 @@ func (rf *Raft) changeToCandidate() {
 	rf.state = Candidate
 	rf.currentTerm++
 	rf.votedFor = rf.me
-	rf.hasVotes = 1 // vote for myself
+	rf.hasVotes = 1 // vote for itself
 	rf.timer.Reset(rf.GetRandomElectionTimeout())
 	rf.persist()
 }
@@ -491,9 +474,8 @@ func (rf *Raft) appendEntriesToPeers(peerIdx int) {
 				}
 				rf.mu.Unlock()
 			}
-
 		} else { // if ok == false
-			DPrintf("[WARN] Leader %d calls AppendEntries to server %d failed", rf.me, peerIdx)
+			DPrintf("[INFO] Leader %d calls AppendEntries to server %d failed", rf.me, peerIdx)
 			return
 		}
 	}
@@ -595,6 +577,7 @@ func (rf *Raft) Run() {
 		rf.mu.Lock()
 		state := rf.state
 		rf.mu.Unlock()
+
 		switch {
 		case state == Leader:
 			DPrintf("[INFO] Candidate %d becomes the leader, current term: %d\n", rf.me, rf.currentTerm)
@@ -608,20 +591,19 @@ func (rf *Raft) Run() {
 				rf.mu.Lock()
 				rf.changeToFollower(rf.currentTerm, -1)
 				rf.mu.Unlock()
-			case <-rf.leaderCh:
-			case <-rf.timer.C:
+			case <-rf.leaderCh: // a candidate has been changed to a leader
+			case <-rf.timer.C: // timeout, a new term follower or a new election
 				rf.mu.Lock()
 				if rf.state == Follower {
 					DPrintf("[INFO] Candidate %d knows a higher term candidate now, withdraw from the election\n", rf.me)
-					rf.mu.Unlock()
-					continue
+				} else {
+					rf.changeToCandidate()
 				}
-				rf.changeToCandidate()
 				rf.mu.Unlock()
 			}
 		case state == Follower:
 			rf.mu.Lock()
-			// the timer needs to be clear, because the server may have been a leader
+			// the timer needs to be clear, because the server may have been a leader in the previous term
 			rf.timerClear()
 			rf.timer.Reset(rf.GetRandomElectionTimeout())
 			rf.mu.Unlock()
@@ -631,7 +613,7 @@ func (rf *Raft) Run() {
 			case <-rf.heartBeatCh:
 				DPrintf("[INFO] Server %d resets election time due to heartbeat\n", rf.me)
 			case <-rf.timer.C:
-				DPrintf("[WARN] Server %d election timeout, turn to candidate\n", rf.me) // run for the leader
+				DPrintf("[INFO] Server %d election timeout, turn to candidate\n", rf.me) // run for the leader
 				rf.mu.Lock()
 				rf.changeToCandidate()
 				rf.mu.Unlock()
@@ -640,6 +622,9 @@ func (rf *Raft) Run() {
 	}
 }
 
+//
+// A candidate starts election
+//
 func (rf *Raft) startsElection() {
 	DPrintf("[INFO] Candidate %d starts the election, current term: %d, current log: %v\n", rf.me, rf.currentTerm, rf.log)
 	rf.mu.Lock()
@@ -665,14 +650,14 @@ func (rf *Raft) startsElection() {
 }
 
 func (rf *Raft) requestVoteFromPeer(peerIdx int, args RequestVoteArgs, leaderNum *int) {
-	if peerIdx == rf.me {
+	if peerIdx == rf.me { // don't request vote for itself
 		return
 	}
 	reply := RequestVoteReply{}
 	ok := rf.sendRequestVote(peerIdx, args, &reply)
 	if ok {
 		rf.mu.Lock()
-		if reply.Term > rf.currentTerm {
+		if reply.Term > rf.currentTerm { // there is a new term, change to follower
 			rf.changeToFollower(reply.Term, -1)
 			rf.mu.Unlock()
 			return
@@ -686,18 +671,17 @@ func (rf *Raft) requestVoteFromPeer(peerIdx int, args RequestVoteArgs, leaderNum
 			return
 		}
 
-		if reply.VoteGranted {
+		if reply.VoteGranted { // receive a valid vote
 			rf.hasVotes++
 			if *leaderNum == 0 && rf.hasVotes > len(rf.peers)/2 && rf.state == Candidate {
 				*leaderNum++
 				rf.changeToLeader()
-				rf.setLeaderCh()
 			}
 		}
 		rf.mu.Unlock()
 
 	} else { // if rf.sendRequestVote is not ok
-		DPrintf("[WARN] Candidate %d sends RequestVote to server %d failed\n", rf.me, peerIdx)
+		DPrintf("[INFO] Candidate %d sends RequestVote to server %d failed\n", rf.me, peerIdx)
 	}
 }
 
@@ -709,6 +693,17 @@ func (rf *Raft) changeToLeader() {
 		rf.nextIndex[i] = len(rf.log) + 1
 		rf.matchIndex[i] = 0
 	}
+	rf.setLeaderCh()
+}
+
+func (rf *Raft) setGrantVoteCh() {
+	go func() { // a routine
+		select { // block if no case is available
+		case <-rf.grantVoteCh:
+		default:
+		}
+		rf.grantVoteCh <- true
+	}()
 }
 
 func (rf *Raft) setLeaderCh() {
@@ -768,8 +763,6 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.me = me
 
 	// Your initialization code here.
-
-	// Assignment 1
 
 	rf.currentTerm = 0
 	rf.votedFor = -1
