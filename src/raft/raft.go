@@ -697,7 +697,7 @@ func (rf *Raft) changeToLeader() {
 }
 
 func (rf *Raft) setGrantVoteCh() {
-	go func() { // a routine
+	go func() {  // a routine
 		select { // block if no case is available
 		case <-rf.grantVoteCh:
 		default:
